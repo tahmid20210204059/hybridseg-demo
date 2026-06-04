@@ -65,80 +65,49 @@ def clean_image(gray):
     return img
 
 
-def get_roi_crops(img):
+def get_primary_roi(img, invert=False):
     H, W = img.shape
-    crops = []
-
     blur = cv2.GaussianBlur(img, (5, 5), 0)
 
-    _, otsu = cv2.threshold(
-        blur, 0, 255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-    contours_bright, _ = cv2.findContours(
-        otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    if contours_bright:
-        largest = max(contours_bright, key=cv2.contourArea)
-        if cv2.contourArea(largest) > 100:
-            x, y, w, h = cv2.boundingRect(largest)
-            for pad_ratio in [0.10, 0.20, 0.30]:
-                pad_x = int(w * pad_ratio)
-                pad_y = int(h * pad_ratio)
-                x1 = max(0, x - pad_x)
-                y1 = max(0, y - pad_y)
-                x2 = min(W, x + w + pad_x)
-                y2 = min(H, y + h + pad_y)
-                crop = img[y1:y2, x1:x2]
-                if crop.size > 0:
-                    crops.append(crop)
+    flag = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+    _, thresh = cv2.threshold(blur, 0, 255, flag + cv2.THRESH_OTSU)
 
-    _, otsu_inv = cv2.threshold(
-        blur, 0, 255,
-        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    otsu_inv = cv2.morphologyEx(otsu_inv, cv2.MORPH_OPEN, kernel)
-    otsu_inv = cv2.morphologyEx(otsu_inv, cv2.MORPH_CLOSE, kernel)
+    if invert:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        bh, bw = H // 8, W // 8
+        thresh[:bh, :] = 0
+        thresh[H-bh:, :] = 0
+        thresh[:, :bw] = 0
+        thresh[:, W-bw:] = 0
 
-    bh, bw = H // 8, W // 8
-    otsu_inv[:bh, :] = 0
-    otsu_inv[H-bh:, :] = 0
-    otsu_inv[:, :bw] = 0
-    otsu_inv[:, W-bw:] = 0
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
 
-    contours_dark, _ = cv2.findContours(
-        otsu_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    if contours_dark:
-        valid = [c for c in contours_dark if cv2.contourArea(c) > 200]
-        if valid:
-            largest_dark = max(valid, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(largest_dark)
-            for pad_ratio in [0.10, 0.20, 0.30]:
-                pad_x = int(w * pad_ratio)
-                pad_y = int(h * pad_ratio)
-                x1 = max(0, x - pad_x)
-                y1 = max(0, y - pad_y)
-                x2 = min(W, x + w + pad_x)
-                y2 = min(H, y + h + pad_y)
-                crop = img[y1:y2, x1:x2]
-                if crop.size > 0:
-                    crops.append(crop)
+    valid = [c for c in contours if cv2.contourArea(c) > (200 if invert else 100)]
+    if not valid:
+        return None
 
-    if not crops:
-        short = min(H, W)
-        cy = (H - short) // 2
-        cx = (W - short) // 2
-        crops.append(img[cy:cy+short, cx:cx+short])
+    return cv2.boundingRect(max(valid, key=cv2.contourArea))
 
-    return crops
+
+def build_crop(img, bbox, pad_ratio):
+    H, W = img.shape
+    x, y, w, h = bbox
+    pad_x = int(w * pad_ratio)
+    pad_y = int(h * pad_ratio)
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y - pad_y)
+    x2 = min(W, x + w + pad_x)
+    y2 = min(H, y + h + pad_y)
+    crop = img[y1:y2, x1:x2]
+    return crop if crop.size > 0 else None
 
 
 def process_crop(crop, img_size):
     crop = cv2.resize(crop, (img_size, img_size), interpolation=cv2.INTER_AREA)
-
-    crop = cv2.bilateralFilter(crop, d=9, sigmaColor=50, sigmaSpace=50)
 
     dr = int(crop.max()) - int(crop.min())
     clip = 3.0 if dr < 150 else 2.0
@@ -161,7 +130,28 @@ def process_crop(crop, img_size):
 def prepare_tensors(pil_img, img_size):
     gray = np.array(pil_img.convert("L"))
     gray = clean_image(gray)
-    raw_crops = get_roi_crops(gray)
+
+    raw_crops = []
+
+    bright_bbox = get_primary_roi(gray, invert=False)
+    if bright_bbox is not None:
+        for pad in [0.15, 0.25]:
+            c = build_crop(gray, bright_bbox, pad)
+            if c is not None:
+                raw_crops.append(c)
+
+    dark_bbox = get_primary_roi(gray, invert=True)
+    if dark_bbox is not None:
+        c = build_crop(gray, dark_bbox, 0.20)
+        if c is not None:
+            raw_crops.append(c)
+
+    if not raw_crops:
+        H, W = gray.shape
+        short = min(H, W)
+        cy = (H - short) // 2
+        cx = (W - short) // 2
+        raw_crops.append(gray[cy:cy+short, cx:cx+short])
 
     tensors = []
     for crop in raw_crops:
@@ -171,6 +161,18 @@ def prepare_tensors(pil_img, img_size):
         tensors.append((tensor, processed))
 
     return tensors
+
+
+def weighted_fusion(results):
+    total_weight = 0.0
+    fused = None
+    for prob, score in results:
+        w = score ** 2
+        fused = prob * w if fused is None else fused + prob * w
+        total_weight += w
+    if total_weight > 0:
+        fused = fused / total_weight
+    return fused
 
 
 st.title("⚕️ HybridSegModel")
@@ -188,9 +190,9 @@ if uploaded and st.button("▶ Run Segmentation"):
         model = load_model(dataset_name)
         tensor_list = prepare_tensors(pil_img, cfg["img_size"])
 
-        best_prob = None
-        best_score = -1
+        results = []
         best_input = None
+        best_score = -1
 
         for tensor, prep_img in tensor_list:
             tensor = tensor.to(DEVICE)
@@ -200,28 +202,30 @@ if uploaded and st.button("▶ Run Segmentation"):
                 prob = torch.sigmoid(seg)[0, 0].cpu().numpy()
 
             score = float(prob.max())
+            results.append((prob, score))
 
             if score > best_score:
                 best_score = score
-                best_prob = prob
                 best_input = prep_img
 
             del tensor, seg
 
         gc.collect()
 
+        final_prob = weighted_fusion(results)
+
         prep_rgb = cv2.cvtColor(best_input, cv2.COLOR_GRAY2RGB)
         overlay = prep_rgb.copy()
-        overlay[best_prob > 0.5] = [255, 50, 50]
+        overlay[final_prob > 0.5] = [255, 50, 50]
         blended = cv2.addWeighted(prep_rgb, 0.55, overlay, 0.45, 0)
 
         contours, _ = cv2.findContours(
-            (best_prob > 0.5).astype(np.uint8),
+            (final_prob > 0.5).astype(np.uint8),
             cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         cv2.drawContours(blended, contours, -1, (0, 255, 150), 2)
 
-        mask = Image.fromarray((best_prob * 255).astype(np.uint8))
+        mask = Image.fromarray((final_prob * 255).astype(np.uint8))
 
     col1, col2 = st.columns(2)
     with col1:

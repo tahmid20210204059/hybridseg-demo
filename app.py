@@ -2,20 +2,12 @@ from huggingface_hub import hf_hub_download
 import os
 import gc
 
-def download_weights():
-    repo = "hybridseg-demo/hybridseg-weights"
-    for fname in ["busi_best_weights.pth"]:
-        if not os.path.exists(fname):
-            hf_hub_download(repo_id=repo, filename=fname, local_dir=".")
-
-download_weights()
-
 import streamlit as st
 import torch
 import numpy as np
 import cv2
 from PIL import Image
-from model import HybridSegModel, MODEL_CONFIGS
+from model import HybridSegModel
 
 MODEL_CONFIGS = {
     "🩻 Breast Ultrasound (BUSI)": {
@@ -29,9 +21,19 @@ MODEL_CONFIGS = {
 torch.set_num_threads(1)
 DEVICE = torch.device("cpu")
 
+def ensure_weights(fname):
+    if not os.path.exists(fname):
+        with st.spinner(f"Downloading model weights... (~102MB)"):
+            hf_hub_download(
+                repo_id="hybridseg-demo/hybridseg-weights",
+                filename=fname,
+                local_dir="."
+            )
+
 @st.cache_resource
 def load_model(dataset_name):
     cfg = MODEL_CONFIGS[dataset_name]
+    ensure_weights(cfg["weights"])
     model = HybridSegModel(num_classes=1, d_state=8, ssm_warmup=5, in_channels=cfg["in_channels"])
     state = torch.load(cfg["weights"], map_location="cpu", weights_only=True)
     model.load_state_dict(state)

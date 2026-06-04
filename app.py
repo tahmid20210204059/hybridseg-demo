@@ -65,43 +65,27 @@ def clean_image(gray):
     return img
 
 
-def get_primary_roi(img, invert=False):
-    H, W = img.shape
+def get_roi_bbox(img):
     blur = cv2.GaussianBlur(img, (5, 5), 0)
-
-    flag = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
-    _, thresh = cv2.threshold(blur, 0, 255, flag + cv2.THRESH_OTSU)
-
-    if invert:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        bh, bw = H // 8, W // 8
-        thresh[:bh, :] = 0
-        thresh[H-bh:, :] = 0
-        thresh[:, :bw] = 0
-        thresh[:, W-bw:] = 0
-
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
-
-    valid = [c for c in contours if cv2.contourArea(c) > (200 if invert else 100)]
-    if not valid:
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 100:
         return None
+    return cv2.boundingRect(largest)
 
-    return cv2.boundingRect(max(valid, key=cv2.contourArea))
 
-
-def build_crop(img, bbox, pad_ratio):
+def make_crop(img, bbox, pad_ratio):
     H, W = img.shape
     x, y, w, h = bbox
-    pad_x = int(w * pad_ratio)
-    pad_y = int(h * pad_ratio)
-    x1 = max(0, x - pad_x)
-    y1 = max(0, y - pad_y)
-    x2 = min(W, x + w + pad_x)
-    y2 = min(H, y + h + pad_y)
+    px = int(w * pad_ratio)
+    py = int(h * pad_ratio)
+    x1 = max(0, x - px)
+    y1 = max(0, y - py)
+    x2 = min(W, x + w + px)
+    y2 = min(H, y + h + py)
     crop = img[y1:y2, x1:x2]
     return crop if crop.size > 0 else None
 
@@ -131,30 +115,24 @@ def prepare_tensors(pil_img, img_size):
     gray = np.array(pil_img.convert("L"))
     gray = clean_image(gray)
 
-    raw_crops = []
+    crops = []
 
-    bright_bbox = get_primary_roi(gray, invert=False)
-    if bright_bbox is not None:
+    bbox = get_roi_bbox(gray)
+    if bbox is not None:
         for pad in [0.15, 0.25]:
-            c = build_crop(gray, bright_bbox, pad)
+            c = make_crop(gray, bbox, pad)
             if c is not None:
-                raw_crops.append(c)
+                crops.append(c)
 
-    dark_bbox = get_primary_roi(gray, invert=True)
-    if dark_bbox is not None:
-        c = build_crop(gray, dark_bbox, 0.20)
-        if c is not None:
-            raw_crops.append(c)
-
-    if not raw_crops:
+    if not crops:
         H, W = gray.shape
         short = min(H, W)
         cy = (H - short) // 2
         cx = (W - short) // 2
-        raw_crops.append(gray[cy:cy+short, cx:cx+short])
+        crops.append(gray[cy:cy+short, cx:cx+short])
 
     tensors = []
-    for crop in raw_crops:
+    for crop in crops:
         processed = process_crop(crop, img_size)
         arr = processed.astype(np.float32) / 255.0
         tensor = torch.FloatTensor(arr).unsqueeze(0).unsqueeze(0)
@@ -163,16 +141,7 @@ def prepare_tensors(pil_img, img_size):
     return tensors
 
 
-def weighted_fusion(results):
-    total_weight = 0.0
-    fused = None
-    for prob, score in results:
-        w = score ** 2
-        fused = prob * w if fused is None else fused + prob * w
-        total_weight += w
-    if total_weight > 0:
-        fused = fused / total_weight
-    return fused
+
 
 
 st.title("⚕️ HybridSegModel")
@@ -190,7 +159,7 @@ if uploaded and st.button("▶ Run Segmentation"):
         model = load_model(dataset_name)
         tensor_list = prepare_tensors(pil_img, cfg["img_size"])
 
-        results = []
+        best_prob = None
         best_input = None
         best_score = -1
 
@@ -202,17 +171,17 @@ if uploaded and st.button("▶ Run Segmentation"):
                 prob = torch.sigmoid(seg)[0, 0].cpu().numpy()
 
             score = float(prob.max())
-            results.append((prob, score))
 
             if score > best_score:
                 best_score = score
+                best_prob = prob
                 best_input = prep_img
 
             del tensor, seg
 
         gc.collect()
 
-        final_prob = weighted_fusion(results)
+        final_prob = best_prob
 
         prep_rgb = cv2.cvtColor(best_input, cv2.COLOR_GRAY2RGB)
         overlay = prep_rgb.copy()

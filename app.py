@@ -1,5 +1,6 @@
 from huggingface_hub import hf_hub_download
 import os
+import gc
 
 def download_weights():
     repo = "hybridseg-demo/hybridseg-weights"
@@ -16,6 +17,7 @@ import cv2
 from PIL import Image
 from model import HybridSegModel, MODEL_CONFIGS
 
+torch.set_num_threads(1)
 DEVICE = torch.device("cpu")
 
 @st.cache_resource
@@ -25,6 +27,7 @@ def load_model(dataset_name):
     state = torch.load(cfg["weights"], map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     model.eval()
+    gc.collect()
     return model
 
 def preprocess(pil_img, in_channels, img_size):
@@ -52,6 +55,8 @@ if uploaded and st.button("▶ Run Segmentation"):
         with torch.no_grad():
             seg, _ = model(tensor, epoch=999)
             prob = torch.sigmoid(seg)[0, 0].cpu().numpy()
+        del tensor, seg
+        gc.collect()
         orig = np.array(pil_img.convert("RGB").resize((cfg["img_size"], cfg["img_size"])))
         overlay = orig.copy()
         overlay[prob > 0.5] = [255, 50, 50]

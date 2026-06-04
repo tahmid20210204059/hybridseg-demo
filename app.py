@@ -1,42 +1,56 @@
-
+from huggingface_hub import hf_hub_download
 import os
 import gc
+
+import streamlit as st
+import torch
 import numpy as np
 import cv2
-import torch
-import streamlit as st
 from PIL import Image
-from huggingface_hub import hf_hub_download
 from model import HybridSegModel
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
+
 MODEL_CONFIGS = {
     "🩻 Breast Ultrasound (BUSI)": {
         "weights": "busi_best_weights.pth",
         "in_channels": 1,
         "img_size": 384,
-    }
+        "desc": "Breast lesion segmentation from ultrasound images"
+    },
 }
 
-DEVICE = torch.device("cpu")
 torch.set_num_threads(1)
+DEVICE = torch.device("cpu")
+
+# ─────────────────────────────────────────────
+# DOWNLOAD WEIGHTS
+# ─────────────────────────────────────────────
+
+def ensure_weights(fname):
+
+    if not os.path.exists(fname):
+
+        with st.spinner("Downloading model weights..."):
+
+            hf_hub_download(
+                repo_id="hybridseg-demo/hybridseg-weights",
+                filename=fname,
+                local_dir="."
+            )
 
 # ─────────────────────────────────────────────
 # LOAD MODEL
 # ─────────────────────────────────────────────
+
 @st.cache_resource
 def load_model(dataset_name):
 
     cfg = MODEL_CONFIGS[dataset_name]
 
-    if not os.path.exists(cfg["weights"]):
-        hf_hub_download(
-            repo_id="hybridseg-demo/hybridseg-weights",
-            filename=cfg["weights"],
-            local_dir="."
-        )
+    ensure_weights(cfg["weights"])
 
     model = HybridSegModel(
         num_classes=1,
@@ -45,178 +59,323 @@ def load_model(dataset_name):
         in_channels=cfg["in_channels"]
     )
 
-    state = torch.load(cfg["weights"], map_location="cpu", weights_only=True)
+    state = torch.load(
+        cfg["weights"],
+        map_location="cpu",
+        weights_only=True
+    )
+
     model.load_state_dict(state)
+
     model.eval()
 
     gc.collect()
+
     return model
 
-
 # ─────────────────────────────────────────────
-# CONTRAST BOOST
+# CLEANING
 # ─────────────────────────────────────────────
-def enhance(img):
 
-    img = img.astype(np.float32)
+def clean_image(gray):
 
-    img = (img - img.min()) / (img.max() - img.min() + 1e-6)
-    img = (img * 255).astype(np.uint8)
+    img = gray.copy()
 
-    gamma = 1.3
-    lut = np.array([((i/255.0)**gamma)*255 for i in range(256)]).astype(np.uint8)
+    h, w = img.shape
 
-    return cv2.LUT(img, lut)
+    ch = h // 8
+    cw = w // 8
 
+    img[:ch, :cw] = 0
+    img[:ch, w-cw:] = 0
 
-# ─────────────────────────────────────────────
-# ROI DETECTION (TEXTURE BASED)
-# ─────────────────────────────────────────────
-def get_roi(img):
-
-    H, W = img.shape
-
-    lap = cv2.Laplacian(img, cv2.CV_64F)
-    score = np.abs(lap).astype(np.uint8)
-
-    _, mask = cv2.threshold(score, 0, 255, cv2.THRESH_OTSU)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if len(contours) == 0:
-        return img
-
-    largest = max(contours, key=cv2.contourArea)
-
-    x, y, w, h = cv2.boundingRect(largest)
-
-    pad_x = int(w * 0.25)
-    pad_y = int(h * 0.25)
-
-    x1 = max(0, x - pad_x)
-    y1 = max(0, y - pad_y)
-    x2 = min(W, x + w + pad_x)
-    y2 = min(H, y + h + pad_y)
-
-    return img[y1:y2, x1:x2]
-
-
-# ─────────────────────────────────────────────
-# PREPROCESS PIPELINE
-# ─────────────────────────────────────────────
-def preprocess(img, size):
-
-    img = enhance(img)
-    img = get_roi(img)
-
-    img = cv2.resize(img, (size, size))
-
-    # Speckle reduction
-    img = cv2.bilateralFilter(img, 7, 50, 50)
-
-    # CLAHE
-    dr = img.max() - img.min()
-    clip = 3.0 if dr < 150 else 2.0
-
-    img = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(img)
+    img[h-ch:, :cw] = 0
+    img[h-ch:, w-cw:] = 0
 
     return img
 
+# ─────────────────────────────────────────────
+# MULTI-CROP PREPROCESS
+# ─────────────────────────────────────────────
+
+def preprocess_image(gray, img_size):
+
+    img = gray.copy()
+
+    H, W = img.shape
+
+    # Blur for stable threshold
+    blur = cv2.GaussianBlur(img, (5, 5), 0)
+
+    # OTSU
+    _, otsu = cv2.threshold(
+        blur,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    contours, _ = cv2.findContours(
+        otsu,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    crops = []
+
+    # ROI crops
+    if len(contours) > 0:
+
+        largest = max(
+            contours,
+            key=cv2.contourArea
+        )
+
+        x, y, w, h = cv2.boundingRect(largest)
+
+        for pad_ratio in [0.10, 0.20, 0.30]:
+
+            pad_x = int(w * pad_ratio)
+            pad_y = int(h * pad_ratio)
+
+            x1 = max(0, x - pad_x)
+            y1 = max(0, y - pad_y)
+
+            x2 = min(W, x + w + pad_x)
+            y2 = min(H, y + h + pad_y)
+
+            crop = img[y1:y2, x1:x2]
+
+            if crop.size > 0:
+                crops.append(crop)
+
+    # Center crop fallback
+    short = min(H, W)
+
+    cy = (H - short) // 2
+    cx = (W - short) // 2
+
+    center_crop = img[cy:cy+short, cx:cx+short]
+
+    crops.append(center_crop)
+
+    processed = []
+
+    for crop in crops:
+
+        crop = cv2.resize(
+            crop,
+            (img_size, img_size),
+            interpolation=cv2.INTER_AREA
+        )
+
+        # CLAHE
+        dr = int(crop.max()) - int(crop.min())
+
+        clip = 3.0 if dr < 150 else 2.0
+
+        crop = cv2.createCLAHE(
+            clipLimit=clip,
+            tileGridSize=(8, 8)
+        ).apply(crop)
+
+        # DENOISE
+        crop = cv2.fastNlMeansDenoising(
+            crop,
+            None,
+            h=10,
+            templateWindowSize=7,
+            searchWindowSize=21
+        )
+
+        # Z-SCORE NORMALIZATION
+        g = crop.astype(np.float32)
+
+        mu = g.mean()
+
+        sigma = max(g.std(), 1e-6)
+
+        g = (g - mu) / sigma
+
+        g = np.clip(g, -3.0, 3.0)
+
+        g = ((g + 3.0) / 6.0 * 255.0)
+
+        g = g.astype(np.uint8)
+
+        processed.append(g)
+
+    return processed
 
 # ─────────────────────────────────────────────
-# MULTI-SCALE INFERENCE
+# PREPARE MULTIPLE TENSORS
 # ─────────────────────────────────────────────
-def infer_multiscale(model, img, device):
 
-    scales = [256, 384, 512]
+def prepare_tensors(pil_img, img_size):
 
-    probs = []
+    gray = np.array(
+        pil_img.convert("L")
+    )
 
-    for s in scales:
+    gray = clean_image(gray)
 
-        im = cv2.resize(img, (s, s))
+    processed_imgs = preprocess_image(
+        gray,
+        img_size
+    )
 
-        t = torch.FloatTensor(im / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+    tensors = []
 
-        with torch.no_grad():
-            seg, _ = model(t, epoch=999)
-            p = torch.sigmoid(seg)[0, 0].cpu().numpy()
+    for img in processed_imgs:
 
-        p = cv2.resize(p, (img.shape[1], img.shape[0]))
+        arr = img.astype(np.float32) / 255.0
 
-        probs.append(p)
+        tensor = torch.FloatTensor(arr) \
+            .unsqueeze(0) \
+            .unsqueeze(0)
 
-    return np.mean(probs, axis=0)
+        tensors.append(
+            (tensor, img)
+        )
 
-
-# ─────────────────────────────────────────────
-# POST PROCESS
-# ─────────────────────────────────────────────
-def postprocess(prob):
-
-    kernel = np.ones((5, 5), np.uint8)
-
-    mask = (prob > 0.5).astype(np.uint8)
-
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    return mask
-
+    return tensors
 
 # ─────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────
-st.title("⚕️ HybridSeg Full Fixed Pipeline")
 
-dataset_name = st.selectbox("Select Model", list(MODEL_CONFIGS.keys()))
-uploaded = st.file_uploader("Upload Image", type=["png", "jpg", "jpeg"])
+st.title("⚕️ HybridSegModel")
 
+st.markdown(
+    "**ResNet34 + VMamba SSM Bridge + UNet3+**"
+)
+
+dataset_name = st.selectbox(
+    "Select Model",
+    list(MODEL_CONFIGS.keys())
+)
+
+uploaded = st.file_uploader(
+    "Upload Medical Image",
+    type=["png", "jpg", "jpeg"]
+)
 
 # ─────────────────────────────────────────────
-# RUN
+# INFERENCE
 # ─────────────────────────────────────────────
-if uploaded and st.button("▶ Run"):
 
-    pil = Image.open(uploaded)
+if uploaded and st.button("▶ Run Segmentation"):
+
+    pil_img = Image.open(uploaded)
 
     cfg = MODEL_CONFIGS[dataset_name]
 
-    model = load_model(dataset_name)
+    with st.spinner("Running segmentation..."):
 
-    # grayscale
-    img = np.array(pil.convert("L"))
+        model = load_model(dataset_name)
 
-    # preprocess
-    img = preprocess(img, cfg["img_size"])
+        tensor_list = prepare_tensors(
+            pil_img,
+            cfg["img_size"]
+        )
 
-    # inference
-    prob = infer_multiscale(model, img, DEVICE)
+        best_prob = None
+        best_score = -1
+        best_input = None
 
-    mask = postprocess(prob)
+        for tensor, prep_img in tensor_list:
 
-    # confidence FIXED
-    confidence = prob[mask == 1].mean() if mask.sum() > 0 else prob.max()
+            tensor = tensor.to(DEVICE)
 
-    # visualization
-    rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            with torch.no_grad():
 
-    overlay = rgb.copy()
-    overlay[mask == 1] = [255, 50, 50]
+                seg, _ = model(
+                    tensor,
+                    epoch=999
+                )
 
-    blended = cv2.addWeighted(rgb, 0.55, overlay, 0.45, 0)
+                prob = torch.sigmoid(seg)[0, 0] \
+                    .cpu() \
+                    .numpy()
 
-    # OUTPUT
+            score = float(prob.max())
+
+            if score > best_score:
+
+                best_score = score
+                best_prob = prob
+                best_input = prep_img
+
+            del tensor
+            del seg
+
+        gc.collect()
+
+        # PREPROCESSED VIS
+        prep_rgb = cv2.cvtColor(
+            best_input,
+            cv2.COLOR_GRAY2RGB
+        )
+
+        # OVERLAY
+        overlay = prep_rgb.copy()
+
+        overlay[best_prob > 0.5] = [255, 50, 50]
+
+        blended = cv2.addWeighted(
+            prep_rgb,
+            0.55,
+            overlay,
+            0.45,
+            0
+        )
+
+        # CONTOURS
+        contours, _ = cv2.findContours(
+            (best_prob > 0.5).astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        cv2.drawContours(
+            blended,
+            contours,
+            -1,
+            (0, 255, 150),
+            2
+        )
+
+        # MASK
+        mask = Image.fromarray(
+            (best_prob * 255).astype(np.uint8)
+        )
+
+    # ─────────────────────────────────────────
+    # SHOW RESULTS
+    # ─────────────────────────────────────────
+
     col1, col2 = st.columns(2)
 
     with col1:
-        st.image(blended, caption="Prediction Overlay")
+
+        st.image(
+            Image.fromarray(blended),
+            caption="Segmentation Overlay"
+        )
 
     with col2:
-        st.image(mask * 255, caption="Mask")
 
-    st.image(img, caption="Preprocessed Input")
+        st.image(
+            mask,
+            caption="Predicted Mask"
+        )
 
-    st.image((prob * 255).astype(np.uint8), caption="Probability Map")
+    # DEBUG IMAGE
+    st.image(
+        best_input,
+        caption="Best Preprocessed Input"
+    )
 
-    st.success(f"Confidence: {confidence:.3f}")
+    st.success(
+        f"Done! Confidence: {best_score:.3f}"
+    )

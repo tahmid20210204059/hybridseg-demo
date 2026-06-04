@@ -1,6 +1,7 @@
-torch==2.2.0
-torchvision==0.17.0
-gradio==4.44.0
+streamlit
+torch
+torchvision
 numpy
 opencv-python-headless
 Pillow
+huggingface_hub

@@ -1,3 +1,14 @@
+from huggingface_hub import hf_hub_download
+import os
+
+def download_weights():
+    repo = "hybridseg-demo/hybridseg-weights"
+    for fname in ["chest_best_weights.pth", "polyp_best_weights.pth", "busi_best_weights.pth"]:
+        if not os.path.exists(fname):
+            hf_hub_download(repo_id=repo, filename=fname, local_dir=".")
+
+download_weights()
+
 import streamlit as st
 import torch
 import numpy as np
@@ -29,7 +40,6 @@ def preprocess(pil_img, in_channels, img_size):
 
 st.title("⚕️ HybridSegModel")
 st.markdown("**ResNet34 + VMamba SSM Bridge + UNet3+** | 25.53M params | Trained from scratch")
-
 dataset_name = st.selectbox("Select Model", list(MODEL_CONFIGS.keys()))
 uploaded = st.file_uploader("Upload Medical Image", type=["png", "jpg", "jpeg"])
 

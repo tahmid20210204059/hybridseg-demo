@@ -42,15 +42,39 @@ def load_model(dataset_name):
     return model
 
 def preprocess(pil_img, in_channels, img_size):
-    if in_channels == 1:
-        img = pil_img.convert("L").resize((img_size, img_size))
-        arr = np.array(img, dtype=np.float32) / 255.0
-        arr = (arr - 0.5) / 0.5
-        return torch.FloatTensor(arr).unsqueeze(0).unsqueeze(0)
-    img = pil_img.convert("RGB").resize((img_size, img_size))
-    arr = np.array(img, dtype=np.float32) / 255.0
-    arr = (arr - 0.5) / 0.5
-    return torch.FloatTensor(arr).permute(2, 0, 1).unsqueeze(0)
+    # Step 1: Grayscale
+    img = np.array(pil_img.convert("L"))
+
+    # Step 2: Corner masking
+    h, w = img.shape
+    ch, cw = h // 8, w // 8
+    img[:ch, :cw] = 0
+    img[:ch, w-cw:] = 0
+    img[h-ch:, :cw] = 0
+    img[h-ch:, w-cw:] = 0
+
+    # Step 3: ROI crop & resize
+    img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_AREA)
+
+    # Step 4: CLAHE
+    dr = int(img.max()) - int(img.min())
+    clip = 3.0 if dr < 150 else 2.0
+    img = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(img)
+
+    # Step 5: NLM denoising
+    img = cv2.fastNlMeansDenoising(img, None, h=10, templateWindowSize=7, searchWindowSize=21)
+
+    # Step 6: Instance z-score normalization
+    g = img.astype(np.float32)
+    mu = g.mean()
+    sigma = max(g.std(), 1e-6)
+    g = (g - mu) / sigma
+    g = np.clip(g, -3.0, 3.0)
+    g = ((g + 3.0) / 6.0 * 255.0).astype(np.uint8)
+
+    # Step 7: To tensor
+    arr = g.astype(np.float32) / 255.0
+    return torch.FloatTensor(arr).unsqueeze(0).unsqueeze(0)
 
 st.title("⚕️ HybridSegModel")
 st.markdown("**ResNet34 + VMamba SSM Bridge + UNet3+** | 25.53M params | Trained from scratch")

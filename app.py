@@ -4,7 +4,7 @@ import gc
 
 def download_weights():
     repo = "hybridseg-demo/hybridseg-weights"
-    for fname in ["chest_best_weights.pth", "polyp_best_weights.pth", "busi_best_weights.pth"]:
+    for fname in ["busi_best_weights.pth"]:
         if not os.path.exists(fname):
             hf_hub_download(repo_id=repo, filename=fname, local_dir=".")
 
@@ -16,6 +16,15 @@ import numpy as np
 import cv2
 from PIL import Image
 from model import HybridSegModel, MODEL_CONFIGS
+
+MODEL_CONFIGS = {
+    "🩻 Breast Ultrasound (BUSI)": {
+        "weights": "busi_best_weights.pth",
+        "in_channels": 1,
+        "img_size": 384,
+        "desc": "Breast lesion segmentation from ultrasound images"
+    },
+}
 
 torch.set_num_threads(1)
 DEVICE = torch.device("cpu")

@@ -65,20 +65,9 @@ def clean_image(gray):
     return img
 
 
-def apply_gamma(gray, gamma=1.2):
-    inv_gamma = 1.0 / gamma
-    table = np.array([
-        ((i / 255.0) ** inv_gamma) * 255
-        for i in range(256)
-    ]).astype(np.uint8)
-    return cv2.LUT(gray, table)
-
-
-def preprocess_image(gray, img_size):
-    img = gray.copy()
+def get_roi_crops(img):
     H, W = img.shape
-
-    img = apply_gamma(img, gamma=1.2)
+    crops = []
 
     blur = cv2.GaussianBlur(img, (5, 5), 0)
 
@@ -86,85 +75,100 @@ def preprocess_image(gray, img_size):
         blur, 0, 255,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
-
-    contours, _ = cv2.findContours(
+    contours_bright, _ = cv2.findContours(
         otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
+    if contours_bright:
+        largest = max(contours_bright, key=cv2.contourArea)
+        if cv2.contourArea(largest) > 100:
+            x, y, w, h = cv2.boundingRect(largest)
+            for pad_ratio in [0.10, 0.20, 0.30]:
+                pad_x = int(w * pad_ratio)
+                pad_y = int(h * pad_ratio)
+                x1 = max(0, x - pad_x)
+                y1 = max(0, y - pad_y)
+                x2 = min(W, x + w + pad_x)
+                y2 = min(H, y + h + pad_y)
+                crop = img[y1:y2, x1:x2]
+                if crop.size > 0:
+                    crops.append(crop)
 
-    crops = []
+    _, otsu_inv = cv2.threshold(
+        blur, 0, 255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    otsu_inv = cv2.morphologyEx(otsu_inv, cv2.MORPH_OPEN, kernel)
+    otsu_inv = cv2.morphologyEx(otsu_inv, cv2.MORPH_CLOSE, kernel)
 
-    if len(contours) > 0:
-        largest = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(largest)
+    bh, bw = H // 8, W // 8
+    otsu_inv[:bh, :] = 0
+    otsu_inv[H-bh:, :] = 0
+    otsu_inv[:, :bw] = 0
+    otsu_inv[:, W-bw:] = 0
 
-        for pad_ratio in [0.10, 0.20, 0.30]:
-            pad_x = int(w * pad_ratio)
-            pad_y = int(h * pad_ratio)
-            x1 = max(0, x - pad_x)
-            y1 = max(0, y - pad_y)
-            x2 = min(W, x + w + pad_x)
-            y2 = min(H, y + h + pad_y)
-            crop = img[y1:y2, x1:x2]
-            if crop.size > 0:
-                crops.append(crop)
+    contours_dark, _ = cv2.findContours(
+        otsu_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if contours_dark:
+        valid = [c for c in contours_dark if cv2.contourArea(c) > 200]
+        if valid:
+            largest_dark = max(valid, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest_dark)
+            for pad_ratio in [0.10, 0.20, 0.30]:
+                pad_x = int(w * pad_ratio)
+                pad_y = int(h * pad_ratio)
+                x1 = max(0, x - pad_x)
+                y1 = max(0, y - pad_y)
+                x2 = min(W, x + w + pad_x)
+                y2 = min(H, y + h + pad_y)
+                crop = img[y1:y2, x1:x2]
+                if crop.size > 0:
+                    crops.append(crop)
 
-    short = min(H, W)
-    cy = (H - short) // 2
-    cx = (W - short) // 2
-    crops.append(img[cy:cy+short, cx:cx+short])
+    if not crops:
+        short = min(H, W)
+        cy = (H - short) // 2
+        cx = (W - short) // 2
+        crops.append(img[cy:cy+short, cx:cx+short])
 
-    crops.append(img.copy())
+    return crops
 
-    processed = []
-    for crop in crops:
 
-        crop = cv2.resize(
-            crop, (img_size, img_size),
-            interpolation=cv2.INTER_AREA
-        )
+def process_crop(crop, img_size):
+    crop = cv2.resize(crop, (img_size, img_size), interpolation=cv2.INTER_AREA)
 
-        crop = cv2.bilateralFilter(
-            crop,
-            d=9,
-            sigmaColor=50,
-            sigmaSpace=50
-        )
+    crop = cv2.bilateralFilter(crop, d=9, sigmaColor=50, sigmaSpace=50)
 
-        dr = int(crop.max()) - int(crop.min())
-        clip = 3.0 if dr < 150 else 2.0
-        crop = cv2.createCLAHE(
-            clipLimit=clip, tileGridSize=(8, 8)
-        ).apply(crop)
+    dr = int(crop.max()) - int(crop.min())
+    clip = 3.0 if dr < 150 else 2.0
+    crop = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(crop)
 
-        crop = cv2.fastNlMeansDenoising(
-            crop, None,
-            h=10,
-            templateWindowSize=7,
-            searchWindowSize=21
-        )
+    crop = cv2.fastNlMeansDenoising(
+        crop, None, h=10, templateWindowSize=7, searchWindowSize=21
+    )
 
-        g = crop.astype(np.float32)
-        mu = g.mean()
-        sigma = max(g.std(), 1e-6)
-        g = (g - mu) / sigma
-        g = np.clip(g, -3.0, 3.0)
-        g = ((g + 3.0) / 6.0 * 255.0).astype(np.uint8)
+    g = crop.astype(np.float32)
+    mu = g.mean()
+    sigma = max(g.std(), 1e-6)
+    g = (g - mu) / sigma
+    g = np.clip(g, -3.0, 3.0)
+    g = ((g + 3.0) / 6.0 * 255.0).astype(np.uint8)
 
-        processed.append(g)
-
-    return processed
+    return g
 
 
 def prepare_tensors(pil_img, img_size):
     gray = np.array(pil_img.convert("L"))
     gray = clean_image(gray)
-    processed_imgs = preprocess_image(gray, img_size)
+    raw_crops = get_roi_crops(gray)
 
     tensors = []
-    for img in processed_imgs:
-        arr = img.astype(np.float32) / 255.0
+    for crop in raw_crops:
+        processed = process_crop(crop, img_size)
+        arr = processed.astype(np.float32) / 255.0
         tensor = torch.FloatTensor(arr).unsqueeze(0).unsqueeze(0)
-        tensors.append((tensor, img))
+        tensors.append((tensor, processed))
 
     return tensors
 

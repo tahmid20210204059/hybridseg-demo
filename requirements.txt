@@ -1,0 +1,6 @@
+torch==2.2.0
+torchvision==0.17.0
+gradio==4.44.0
+numpy
+opencv-python-headless
+Pillow
